@@ -1,0 +1,9 @@
+langchain
+langchain_community
+openai
+tiktoken
+PyPDF2
+psycopg2-binary
+pgvector
+fastapi
+uvicorn
