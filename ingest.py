@@ -1,8 +1,7 @@
-import os
 import logging
+import os
 import sys
 import PyPDF2
-import psycopg2
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
 

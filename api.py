@@ -3,31 +3,26 @@ import logging
 import sys
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import psycopg2
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
-from langchain.chains import RetrievalQA
-from langchain_community.vectorstores.pgvector import PGVector
 from ingest import PDFIngestor
+from query import RAGQuery  # Updated class with refresh_retriever()
 
 # ------------------ Logging Setup ------------------
 LOG_FOLDER = os.path.join(os.getcwd(), "logs")
-os.makedirs(LOG_FOLDER, exist_ok=True)  # Ensure logs folder exists
+os.makedirs(LOG_FOLDER, exist_ok=True)
 
 def create_logger(name: str, filename: str) -> logging.Logger:
     log_file = os.path.join(LOG_FOLDER, filename)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
-    logger.propagate = False  # Prevent uvicorn from overriding
+    logger.propagate = False
 
     if not logger.hasHandlers():
-        # File handler
         fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
         fh.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s")
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
-        # Console handler
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.INFO)
         ch.setFormatter(formatter)
@@ -59,14 +54,13 @@ class RAGPOC:
         self.cur = self.conn.cursor()
         self.logger.info("Connected to PostgreSQL.")
 
-        # Embeddings & PGVector
-        self.embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        self.vectorstore = self._init_pgvector()
-        self.retriever = self.vectorstore.as_retriever()
-
-        # LLM & RetrievalQA
-        self.llm = Ollama(model="phi3:mini", temperature=0)
-        self.qa = RetrievalQA.from_chain_type(llm=self.llm, retriever=self.retriever, chain_type="stuff")
+        # ----------------- RAGQuery Class -----------------
+        self.rag_query = RAGQuery(
+            pg_connection_string="postgresql://postgres:postgres@localhost:5433/rag_poc",
+            table_name="documents",
+            llm_model="phi3:mini",
+            embedding_model="nomic-embed-text:latest"
+        )
 
         # PDF Ingestor
         self.data_folder = "data"
@@ -76,27 +70,6 @@ class RAGPOC:
         # Setup API routes
         self._setup_routes()
         self.app.on_event("shutdown")(self._shutdown_event)
-
-    def _init_pgvector(self):
-        CONNECTION_STRING = "postgresql://postgres:postgres@localhost:5433/rag_poc"
-        TABLE_NAME = "documents"
-        try:
-            vs = PGVector.from_existing_index(
-                embedding=self.embeddings,
-                connection_string=CONNECTION_STRING,
-                table_name=TABLE_NAME
-            )
-            self.logger.info("Loaded existing PGVector index.")
-        except Exception as e:
-            self.logger.warning("No existing PGVector index. Creating new one. (%s)", e)
-            vs = PGVector.from_documents(
-                documents=[],
-                embedding=self.embeddings,
-                connection_string=CONNECTION_STRING,
-                table_name=TABLE_NAME
-            )
-            self.logger.info("Created new PGVector table.")
-        return vs
 
     def _setup_routes(self):
         @self.app.post("/ingest_pdf")
@@ -110,9 +83,14 @@ class RAGPOC:
                     f.write(await file.read())
                 self.logger.info("Saved uploaded PDF: %s", file_path)
 
+                # Ingest PDF
                 chunks, num_chunks = self.ingestor.ingest_pdf_file(file_path)
                 if num_chunks > 0:
-                    self.vectorstore.add_texts(chunks)
+                    self.logger.info("Added %d chunks to the database.", num_chunks)
+
+                    # Efficiently refresh retriever so queries see new documents immediately
+                    self.rag_query.refresh_retriever()
+                    self.logger.info("Retriever refreshed after ingestion.")
 
                 return {"message": f"Ingested {filename} with {num_chunks} chunks"}
 
@@ -122,8 +100,10 @@ class RAGPOC:
 
         @self.app.get("/query")
         async def query_rag(q: str):
+            self.logger.info("Received query: %s", q)
             try:
-                answer = self.qa.run(q)
+                answer = self.rag_query.run_query(q)
+                self.logger.info("Query answered successfully.")
                 return {"query": q, "answer": answer}
             except Exception as e:
                 self.logger.exception("Error during query.")
